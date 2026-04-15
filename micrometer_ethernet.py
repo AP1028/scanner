@@ -20,7 +20,7 @@ def fast_binary_poll():
     print(f"Connecting to {IP_ADDRESS}:{TCP_PORT}...")
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # Disable Nagle's algorithm to allow 1000Hz+ speeds
+        # Disable Nagle's algorithm for 1000Hz+ speeds
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
         s.settimeout(2.0)
         
@@ -41,8 +41,7 @@ def fast_binary_poll():
         # Send Handshake 2
         s.sendall(HANDSHAKE_2)
         
-        # Note: Handshake 2 triggers a massive ~5KB metadata reply from the controller. 
-        # We need to loop slightly to clear the socket buffer so it doesn't bleed into our polling loop.
+        # Clear the initial massive metadata buffer
         print("Clearing initial metadata buffer...")
         s.settimeout(0.5)
         while True:
@@ -67,22 +66,25 @@ def fast_binary_poll():
                 # 1. Fire the polling command
                 sendall(POLL_CMD)
                 
-                # 2. Grab the response (Expected length based on Wireshark: 72 bytes)
+                # 2. Grab the response
                 data = recv(1024)
                 
                 if data:
-                    # Print the raw hex data with spaces between bytes
-                    print(f"Length {len(data)} | Data: {data.hex(' ')}")
-                    
-                    # --- DECODING THE FLOAT ---
-                    # Once you run this script, look at the hex output.
-                    # Find the 4-byte chunk that changes as your measurement changes.
-                    # Example: If your measurement is located at byte indices 32 through 35,
-                    # uncomment the lines below to decode it into a real Python number:
-                    #
-                    # val = struct.unpack('<f', data[32:36])[0] 
-                    # print(val)
-                    
+                    # 3. Only process the 72-byte data packets (ignore 4-byte keep-alives)
+                    if len(data) == 72:
+                        
+                        # Extract the 4 bytes containing the measurement (Index 64 to 67)
+                        raw_bytes = data[64:68]
+                        
+                        # Unpack as a little-endian signed 32-bit integer ('<i')
+                        raw_int = struct.unpack('<i', raw_bytes)[0]
+                        
+                        # Scale it back to millimeters (1 unit = 0.0001 mm)
+                        measurement_mm = raw_int * 0.0001
+                        
+                        # Print the clean output
+                        print(f"Measurement: {measurement_mm:.4f} mm")
+                        
         except KeyboardInterrupt:
             print("\nPolling stopped by user.")
         except Exception as e:
