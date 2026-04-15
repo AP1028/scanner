@@ -63,32 +63,28 @@ HANDSHAKE_1 = bytes.fromhex("10000000 02 00 f000 00000000 04000000 37000000".rep
 HANDSHAKE_2 = bytes.fromhex("18000000 02 00 f000 00000000 0c000000 31000000 01000000 10ff0000".replace(" ", ""))
 POLL_CMD    = bytes.fromhex("14000000 02 00 f000 00000000 08000000 41000000 00000000".replace(" ", ""))
 
-# Scan parameters
+# Scan & Loop parameters
 ENCODER_COUNTS_PER_MM = 50      # 1 count = 20 µm  →  50 counts = 1 mm
-POLL_RATE_HZ          = 200     # polling rate for scan loop
-SCAN_SPEED_MM_S       = 2.0     # target forward speed (mm/s) – change as needed
-MAX_SPEED_MM_S        = 4.0     # hard ceiling for PID output
+POLL_RATE_HZ          = 200     # DATA LOGGING RATE: 200Hz for high-res CSV
+PID_RATE_HZ           = 50      # MOTOR CONTROL RATE: Bumped to 50Hz for smoother calculation
+SCAN_SPEED_MM_S       = 1.0     # target forward speed (mm/s)
+MAX_SPEED_MM_S        = 4.0     # hard ceiling for target input
 
 # Approach-to-zero (return trip): open-loop duty cycle
 RETURN_DUTY           = 0.15    # ~15 % – slow enough to not slam the hard stop
-
-# Hard-stop proximity: encoder counts from the physical zero stop
-# The stage will decelerate when within this many counts on the return
 ZERO_DECEL_ZONE       = 25      # ~0.5 mm deceleration zone
 
 # Stall / collision detection
-# Two separate windows: a moderate one for forward/general use, and a tight one
-# for the return-to-zero trip where hitting the hard stop IS the stop condition.
-# The tight window must be short enough to cut power before the stage deforms
-# anything, but long enough not to false-trigger on normal motor cogging.
-STALL_TIME_S          = 0.05    # seconds — forward pass and jog forward
-STALL_TIME_RETURN_S   = 0.05    # seconds — reverse jog and scan return (hard-stop detection)
-STALL_MIN_COUNTS      = 5       # counts that must change within the window to count as moving
+STALL_TIME_S          = 0.10    # seconds — jog forward
+STALL_TIME_RETURN_S   = 0.05    # seconds — reverse jog and scan return
+STALL_TIME_SCAN_S     = 0.50    # seconds — grace period for PID to spool up during scan
+STALL_MIN_COUNTS      = 2       # counts that must change within the window
 
-# PID gains (tune as needed)
-KP = 0.005
-KI = 0.001
-KD = 0.0005
+# Soft-Start PID gains 
+# (Since the loop is now 50Hz, dt accurately scales the math automatically)
+KP = 0.0004
+KI = 0.002
+KD = 0.0
 
 
 # ══════════════════════════════════════════════
@@ -96,24 +92,24 @@ KD = 0.0005
 # ══════════════════════════════════════════════
 
 class MotorDriver:
-    """Thin wrapper around the BTS7960 half-bridge driver."""
-
     def __init__(self):
         self.r_en  = DigitalOutputDevice(PIN_R_EN)
         self.l_en  = DigitalOutputDevice(PIN_L_EN)
-        self.rpwm  = PWMOutputDevice(PIN_RPWM)
-        self.lpwm  = PWMOutputDevice(PIN_LPWM)
+        
+        # INCREASED PWM FREQUENCY TO 2000Hz (Default was 100Hz)
+        # This eliminates physical coil vibrations and electrical microjitters.
+        self.rpwm  = PWMOutputDevice(PIN_RPWM, frequency=2000)
+        self.lpwm  = PWMOutputDevice(PIN_LPWM, frequency=2000)
+        
         self.r_en.on()
         self.l_en.on()
 
     def forward(self, duty: float):
-        """Drive forward at duty cycle [0.0 – 1.0]."""
         duty = max(0.0, min(1.0, duty))
         self.lpwm.value = 0.0
         self.rpwm.value = duty
 
     def reverse(self, duty: float):
-        """Drive in reverse at duty cycle [0.0 – 1.0]."""
         duty = max(0.0, min(1.0, duty))
         self.rpwm.value = 0.0
         self.lpwm.value = duty
@@ -133,8 +129,6 @@ class MotorDriver:
 # ══════════════════════════════════════════════
 
 class EncoderReader:
-    """Wraps a Phidget encoder with a position offset for zeroing."""
-
     def __init__(self):
         self._offset = 0
         self.enc = Encoder()
@@ -146,11 +140,9 @@ class EncoderReader:
         self.enc.setDataInterval(min_di)
 
     def position(self) -> int:
-        """Return zeroed encoder position in counts."""
         return self.enc.getPosition() - self._offset
 
     def zero(self):
-        """Set current position as zero."""
         self._offset = self.enc.getPosition()
         print(f"Encoder zeroed. Raw hardware position was {self._offset}.")
 
@@ -163,12 +155,6 @@ class EncoderReader:
 # ══════════════════════════════════════════════
 
 class Micrometer:
-    """
-    Connects to the Mitutoyo micrometer over TCP.
-    Runs a background thread that polls at ~POLL_RATE_HZ and stores
-    the latest reading.  The scan loop reads self.latest_mm.
-    """
-
     def __init__(self):
         self.latest_mm: float = 0.0
         self._sock: socket.socket | None = None
@@ -180,20 +166,16 @@ class Micrometer:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.settimeout(2.0)
         s.connect((MICROMETER_IP, MICROMETER_PORT))
-
         s.sendall(HANDSHAKE_1)
         s.recv(1024)
         s.sendall(HANDSHAKE_2)
-
-        # drain initial metadata burst
         s.settimeout(0.5)
+        
         while True:
             try:
                 chunk = s.recv(4096)
-                if not chunk:
-                    break
-            except socket.timeout:
-                break
+                if not chunk: break
+            except socket.timeout: break
 
         s.settimeout(1.0)
         self._sock = s
@@ -211,7 +193,7 @@ class Micrometer:
                     raw_int = struct.unpack('<i', data[64:68])[0]
                     self.latest_mm = raw_int * 0.0001
             except Exception:
-                pass   # keep trying; stale value is acceptable for a cycle
+                pass
 
     def close(self):
         self._running = False
@@ -224,20 +206,12 @@ class Micrometer:
 # ══════════════════════════════════════════════
 
 class StallDetector:
-    """
-    Monitors encoder movement.  If the stage does not move STALL_MIN_COUNTS
-    within stall_time seconds, it is considered stalled.
-
-    Use a short stall_time (STALL_TIME_RETURN_S) for reverse moves so the
-    hard stop is detected quickly before anything is deformed.
-    """
-
     def __init__(self, encoder: EncoderReader, stall_time: float = STALL_TIME_S):
-        self._enc       = encoder
+        self._enc        = encoder
         self._stall_time = stall_time
-        self._last_pos  = encoder.position()
-        self._last_t    = time.monotonic()
-        self.stalled    = False
+        self._last_pos   = encoder.position()
+        self._last_t     = time.monotonic()
+        self.stalled     = False
 
     def reset(self):
         self._last_pos = self._enc.position()
@@ -245,7 +219,6 @@ class StallDetector:
         self.stalled   = False
 
     def update(self) -> bool:
-        """Returns True if a stall is detected."""
         now = time.monotonic()
         pos = self._enc.position()
         if abs(pos - self._last_pos) >= STALL_MIN_COUNTS:
@@ -275,7 +248,7 @@ class PID:
         self._integral += error * dt
         derivative      = (error - self._prev_err) / dt if dt > 0 else 0.0
         self._prev_err  = error
-        output = self.kp * error + self.ki * self._integral + self.kd * derivative
+        output = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
         return max(self.out_min, min(self.out_max, output))
 
 
@@ -284,9 +257,6 @@ class PID:
 # ══════════════════════════════════════════════
 
 def run_scan(motor: MotorDriver, enc: EncoderReader, mic: Micrometer):
-    """Interactive scan: asks for target, then runs the full forward+return cycle."""
-
-    # --- Ask for scan target ---
     print()
     raw = input("Enter scan target as encoder counts or mm (e.g. '500' or '10mm'): ").strip()
     if raw.lower().endswith("mm"):
@@ -297,8 +267,7 @@ def run_scan(motor: MotorDriver, enc: EncoderReader, mic: Micrometer):
     speed_input = input(f"Target forward speed mm/s [{SCAN_SPEED_MM_S}]: ").strip()
     target_speed_mm_s = float(speed_input) if speed_input else SCAN_SPEED_MM_S
     target_speed_mm_s = min(target_speed_mm_s, MAX_SPEED_MM_S)
-
-    target_speed_cps = target_speed_mm_s * ENCODER_COUNTS_PER_MM  # counts per second
+    target_speed_cps = target_speed_mm_s * ENCODER_COUNTS_PER_MM
 
     ts_str  = datetime.now().strftime("%Y%m%d_%H%M%S")
     outfile = f"scan_{ts_str}.csv"
@@ -308,51 +277,57 @@ def run_scan(motor: MotorDriver, enc: EncoderReader, mic: Micrometer):
     print("Starting in 2 seconds…  (Ctrl+C aborts)\n")
     time.sleep(2)
 
-    pid     = PID(KP, KI, KD, output_min=0.0, output_max=1.0)
-    stall   = StallDetector(enc)
-    dt      = 1.0 / POLL_RATE_HZ
+    # PID is strictly capped at 8% power to prevent violent jerks
+    pid     = PID(KP, KI, KD, output_min=0.0, output_max=0.08)
+    stall   = StallDetector(enc, stall_time=STALL_TIME_SCAN_S)
+    
+    # Calculate intervals
+    dt_poll = 1.0 / POLL_RATE_HZ
+    dt_pid  = 1.0 / PID_RATE_HZ
+    
     rows    = []
+    t_start = time.monotonic()
+    
+    # PID tracking variables
+    prev_pid_pos = enc.position()
+    prev_pid_t   = t_start
+    actual_cps   = 0.0
+    duty         = 0.0
 
-    t_start     = time.monotonic()
-    prev_pos    = enc.position()
-    prev_t      = t_start
-
-    # ── FORWARD PASS ──────────────────────────────
     print("[SCAN] Forward pass started.")
     try:
         while True:
             loop_start = time.monotonic()
 
-            pos       = enc.position()
-            elapsed   = loop_start - t_start
+            pos        = enc.position()
+            elapsed    = loop_start - t_start
             mm_reading = mic.latest_mm
 
-            # Record data (no printing during scan)
-            rows.append((elapsed, pos, mm_reading))
-
-            # Speed estimation (counts/s over last cycle)
+            # --- 1. PID CONTROL BLOCK (Runs at 50Hz) ---
             now = time.monotonic()
-            actual_cps = (pos - prev_pos) / (now - prev_t) if (now - prev_t) > 0 else 0.0
-            prev_pos, prev_t = pos, now
+            if (now - prev_pid_t) >= dt_pid:
+                actual_cps = (pos - prev_pid_pos) / (now - prev_pid_t)
+                error = target_speed_cps - actual_cps
+                duty  = pid.compute(error, now - prev_pid_t)
+                motor.forward(duty)
+                
+                prev_pid_pos = pos
+                prev_pid_t   = now
 
-            # PID on speed error
-            error = target_speed_cps - actual_cps
-            duty  = pid.compute(error, dt)
-            motor.forward(duty)
+            # --- 2. DATA LOGGING BLOCK (Runs at 200Hz) ---
+            rows.append((elapsed, pos, mm_reading, actual_cps, duty))
 
-            # Stall check
             if stall.update():
                 print("\n[STALL DETECTED] Motor stopped during forward pass. Aborting.")
                 motor.stop()
                 return
 
-            # End condition
             if pos >= target_counts:
                 break
 
-            # Pace the loop
+            # --- 3. PACING LOOP (Sleeps to maintain 200Hz) ---
             elapsed_loop = time.monotonic() - loop_start
-            sleep_t = dt - elapsed_loop
+            sleep_t = dt_poll - elapsed_loop
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
@@ -366,45 +341,44 @@ def run_scan(motor: MotorDriver, enc: EncoderReader, mic: Micrometer):
     print(f"[SCAN] Forward pass complete at position {enc.position()} counts.")
     time.sleep(0.3)
 
-    # ── RETURN PASS (open-loop, slow, collision-aware) ────────────────────
     print("[SCAN] Returning to zero…")
     stall.reset()
     stall = StallDetector(enc, stall_time=STALL_TIME_RETURN_S)
     try:
         while True:
+            loop_start = time.monotonic()
             pos = enc.position()
-
-            # Slow down in the deceleration zone near zero
+            
             if pos <= ZERO_DECEL_ZONE:
-                duty = RETURN_DUTY * 0.5   # half power for the last stretch
+                duty = RETURN_DUTY * 0.5
             else:
                 duty = RETURN_DUTY
-
             motor.reverse(duty)
 
-            # Stall = hard stop reached, regardless of encoder value
             if stall.update():
                 print("\n[HARD STOP REACHED] Motor stopped during return.")
                 break
-
-            time.sleep(dt)
-
+                
+            # Pace the return loop as well
+            elapsed_loop = time.monotonic() - loop_start
+            sleep_t = dt_poll - elapsed_loop
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+                
     except KeyboardInterrupt:
         print("\n[ABORTED] Return interrupted by user.")
 
     motor.stop()
     print(f"[SCAN] Returned. Final position: {enc.position()} counts.")
-
     _save_csv(rows, outfile)
 
 
 def _save_csv(rows, filename):
     if not rows:
-        print("No data to save.")
         return
     with open(filename, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["timestamp_s", "encoder_counts", "micrometer_mm"])
+        writer.writerow(["timestamp_s", "encoder_counts", "micrometer_mm", "actual_cps", "duty_out"])
         writer.writerows(rows)
     print(f"[DATA] {len(rows)} samples saved to '{filename}'.")
 
@@ -414,20 +388,18 @@ def _save_csv(rows, filename):
 # ══════════════════════════════════════════════
 
 def jog(motor: MotorDriver, enc: EncoderReader, direction: str):
-    """Run motor in direction ('fwd' or 'rev') until the user presses Enter."""
-    duty = 0.1
+    duty = 0.05  # Reduced from 0.1 so it doesn't fly out of control
     print(f"Jogging {'forward' if direction == 'fwd' else 'reverse'} at {duty*100:.0f}% duty.")
     print("Press Enter to stop.")
 
     stop_event = threading.Event()
 
     def _motor_loop():
-        stall = StallDetector(enc, stall_time=STALL_TIME_S if direction == 'fwd'
-                                                            else STALL_TIME_RETURN_S)
+        stall = StallDetector(enc, stall_time=STALL_TIME_S if direction == 'fwd' else STALL_TIME_RETURN_S)
         while not stop_event.is_set():
-            if direction == 'fwd':
+            if direction == 'fwd': 
                 motor.forward(duty)
-            else:
+            else: 
                 motor.reverse(duty)
 
             if stall.update():
@@ -439,11 +411,10 @@ def jog(motor: MotorDriver, enc: EncoderReader, direction: str):
 
     t = threading.Thread(target=_motor_loop, daemon=True)
     t.start()
-    input()          # blocks until Enter
+    input()
     stop_event.set()
     t.join()
-    print(f"Jog stopped. Position: {enc.position()} counts "
-          f"({enc.position()/ENCODER_COUNTS_PER_MM:.3f} mm)")
+    print(f"Jog stopped. Position: {enc.position()} counts ({enc.position()/ENCODER_COUNTS_PER_MM:.3f} mm)")
 
 
 # ══════════════════════════════════════════════
@@ -462,45 +433,11 @@ MENU = """
 ╚══════════════════════════════╝
 """
 
-# Global flag: when True, the live display thread prints to the terminal.
-# Set to False before any motion routine, True again after.
-_display_active = threading.Event()
-_display_active.set()   # on by default
-
-
-def _live_display_loop(enc: EncoderReader, mic: Micrometer):
-    """Background thread: print encoder + micrometer whenever display is active."""
-    while True:
-        _display_active.wait()          # block while motion routines are running
-        pos = enc.position()
-        mm  = mic.latest_mm
-        sys.stdout.write(
-            f"\r  Encoder: {pos:>6} counts "
-            f"({pos / ENCODER_COUNTS_PER_MM:>8.3f} mm)   "
-            f"Micrometer: {mm:>10.4f} mm    "
-        )
-        sys.stdout.flush()
-        time.sleep(0.1)
-
-
-def _pause_display():
-    """Call before starting any motion routine."""
-    _display_active.clear()
-    sys.stdout.write("\n")   # leave the live display line intact before printing motion output
-    sys.stdout.flush()
-
-
-def _resume_display():
-    """Call after a motion routine finishes."""
-    _display_active.set()
-
 def main():
     print(MENU)
-
-    # Initialise hardware
     print("Initialising motor driver…")
     motor = MotorDriver()
-
+    
     print("Connecting to encoder…")
     try:
         enc = EncoderReader()
@@ -518,55 +455,38 @@ def main():
         enc.close()
         raise SystemExit(f"Micrometer failed: {e}")
 
-    # Start live display thread (runs whenever _display_active is set)
-    display_thread = threading.Thread(
-        target=_live_display_loop, args=(enc, mic), daemon=True
-    )
-    display_thread.start()
-
     try:
         while True:
-            cmd = input("\n> ").strip().lower()
-
+            # Print current status cleanly ONCE before asking for input
+            pos = enc.position()
+            mm  = mic.latest_mm
+            print(f"\n[STATUS] Encoder: {pos} counts ({pos / ENCODER_COUNTS_PER_MM:.3f} mm) | Micrometer: {mm:.4f} mm")
+            
+            cmd = input("> ").strip().lower()
+            
             if cmd == 'scan':
-                _pause_display()
                 run_scan(motor, enc, mic)
-                _resume_display()
-
             elif cmd == 'fwd':
-                _pause_display()
                 jog(motor, enc, 'fwd')
-                _resume_display()
-
             elif cmd == 'rev':
-                _pause_display()
                 jog(motor, enc, 'rev')
-                _resume_display()
-
             elif cmd == 'zero':
-                _pause_display()
                 enc.zero()
-                _resume_display()
-
-            elif cmd in ('quit', 'exit', 'q'):
+            elif cmd in ('quit', 'exit', 'q'): 
                 break
-
-            elif cmd == '':
-                pass   # ignore blank input
-
-            else:
+            elif cmd == '': 
+                pass # Pressing enter just reprints the status cleanly
+            else: 
                 print("Unknown command. Try: scan | fwd | rev | zero | quit")
-
+                
     except KeyboardInterrupt:
         print("\nInterrupted.")
-
     finally:
         print("Shutting down…")
         motor.shutdown()
         enc.close()
         mic.close()
         print("Done.")
-
 
 if __name__ == "__main__":
     main()
